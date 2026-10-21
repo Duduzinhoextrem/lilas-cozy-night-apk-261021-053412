@@ -1,4 +1,5 @@
 name: Gerar APK Lila Cozy Night
+
 on:
   workflow_dispatch:
 
@@ -10,36 +11,44 @@ jobs:
     name: Android ARM64
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
       - name: Checkout pacote do mod
         uses: actions/checkout@v4
-      - name: Checkout Codename Engine Mobile (versao do projeto)
+
+      - name: Checkout Codename Engine Mobile
         uses: actions/checkout@v4
         with:
           repository: CPsP-Team/CodenameEngine-Mobile
           ref: 4af5529d60ebf2599372cd95463acfd6707c5cdd
           path: engine
+
       - name: Haxe 4.3.7
         uses: krdlab/setup-haxe@v2
         with:
           haxe-version: 4.3.7
+
       - name: Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - name: Android NDK r25c
         id: ndk
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
+
       - name: Preparar mod e aplicativo
         run: |
           python3 scripts/prepare_engine.py --engine engine
+
       - name: Instalar bibliotecas do engine
         working-directory: engine
         run: |
           haxe -cp commandline -D analyzer-optimize --run Main setup -s
+
       - name: Configurar Lime Android
         working-directory: engine
         env:
@@ -56,18 +65,220 @@ jobs:
           haxelib set flixel-addons git
           haxelib set flixel-animate git
           haxelib set hxdiscord_rpc git
+
       - name: Compilar APK Android
         working-directory: engine
         run: |
           haxelib run lime build android -final -D ONLY_ARM64
-      - name: Verificar APK gerado
+
+      - name: Verificar APK original
         run: |
+          set -euo pipefail
           find engine/export -type f -name '*.apk' -print
           find engine/export -type f -name '*.apk' | grep .
-      - name: Disponibilizar APK
+
+      - name: Corrigir runtime nativo Android
+        shell: bash
+        env:
+          NDK_DIR: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p verified-apk
+
+          APK="$(find engine/export -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+
+          export ORIGINAL_APK="$APK"
+          export OUTPUT_DIR="$GITHUB_WORKSPACE/verified-apk"
+          export NDK_RUNTIME="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          export READELF="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          test -f "$NDK_RUNTIME"
+          test -x "$READELF"
+
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          apk = Path(os.environ["ORIGINAL_APK"])
+          output = Path(os.environ["OUTPUT_DIR"])
+          runtime = Path(os.environ["NDK_RUNTIME"])
+          readelf = os.environ["READELF"]
+
+          symbol = "__emutls_get_address"
+          abi = "arm64-v8a"
+          liblime = f"lib/{abi}/liblime.so"
+          libcxx = f"lib/{abi}/libc++_shared.so"
+
+          output.mkdir(parents=True, exist_ok=True)
+
+          work = output / "work"
+          work.mkdir(exist_ok=True)
+
+          def symbols(path):
+              result = subprocess.run(
+                  [readelf, "--dyn-syms", "--wide", str(path)],
+                  capture_output=True,
+                  text=True,
+                  check=True
+              )
+              return [
+                  line for line in result.stdout.splitlines()
+                  if symbol in line
+              ]
+
+          def exports_symbol(path):
+              return any(
+                  not re.search(r"\bUND\b", line)
+                  for line in symbols(path)
+              )
+
+          print("Verificando runtime C++ do NDK...", flush=True)
+
+          if not exports_symbol(runtime):
+              raise RuntimeError(
+                  "O runtime do NDK nao exporta " + symbol
+              )
+
+          with zipfile.ZipFile(apk) as archive:
+              if liblime not in archive.namelist():
+                  raise RuntimeError("liblime.so ARM64 nao encontrada")
+
+              lime_path = work / "liblime.so"
+              lime_path.write_bytes(archive.read(liblime))
+
+              needs_symbol = any(
+                  re.search(r"\bUND\b", line)
+                  for line in symbols(lime_path)
+              )
+
+              print("liblime precisa de emutls:", needs_symbol)
+
+              old_runtime = work / "old_libcxx.so"
+              if libcxx in archive.namelist():
+                  old_runtime.write_bytes(archive.read(libcxx))
+                  print(
+                      "Runtime original exporta emutls:",
+                      exports_symbol(old_runtime)
+                  )
+              else:
+                  print("Runtime C++ ausente no APK original")
+
+              unsigned = output / "unsigned.apk"
+
+              with zipfile.ZipFile(
+                  unsigned, "w", allowZip64=True
+              ) as target:
+
+                  has_runtime = False
+
+                  for info in archive.infolist():
+                      name = info.filename
+
+                      upper = name.upper()
+                      if (
+                          upper.startswith("META-INF/")
+                          and upper.endswith(
+                              (".RSA", ".DSA", ".EC", ".SF")
+                          )
+                      ):
+                          continue
+
+                      if name == libcxx:
+                          has_runtime = True
+                          info.compress_type = zipfile.ZIP_STORED
+                          target.writestr(info, runtime.read_bytes())
+                      else:
+                          target.writestr(
+                              info, archive.read(name)
+                          )
+
+                  if not has_runtime:
+                      target.write(
+                          runtime,
+                          libcxx,
+                          compress_type=zipfile.ZIP_STORED
+                      )
+
+          print("Novo runtime incorporado ao APK.", flush=True)
+          print("APK preparado:", unsigned, flush=True)
+          PY
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -n "$BUILD_TOOLS"
+
+          ZIPALIGN="$BUILD_TOOLS/zipalign"
+          APKSIGNER="$BUILD_TOOLS/apksigner"
+
+          "$ZIPALIGN" -P 16 -f 4 \
+            verified-apk/unsigned.apk \
+            verified-apk/aligned.apk
+
+          "$APKSIGNER" sign \
+            --ks engine/key.keystore \
+            --ks-key-alias psychport \
+            --ks-pass pass:psychengine \
+            --key-pass pass:psychengine \
+            --out verified-apk/Lilas-Cozy-Night.apk \
+            verified-apk/aligned.apk
+
+          "$APKSIGNER" verify --verbose \
+            verified-apk/Lilas-Cozy-Night.apk
+
+          echo "APK corrigido e assinatura verificada."
+
+      - name: Validar bibliotecas do APK final
+        shell: bash
+        env:
+          NDK_DIR: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+
+          APK="verified-apk/Lilas-Cozy-Night.apk"
+          READELF="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+
+          mkdir -p /tmp/lila-check
+
+          unzip -p "$APK" \
+            'lib/arm64-v8a/libc++_shared.so' \
+            > /tmp/lila-check/libcxx.so
+
+          unzip -p "$APK" \
+            'lib/arm64-v8a/liblime.so' \
+            > /tmp/lila-check/liblime.so
+
+          echo "=== Runtime C++ ==="
+          "$READELF" --dyn-syms --wide \
+            /tmp/lila-check/libcxx.so \
+            | grep '__emutls_get_address'
+
+          echo "=== Dependencias liblime ==="
+          "$READELF" -d /tmp/lila-check/liblime.so \
+            | grep NEEDED || true
+
+          echo "=== Validacao do simbolo ==="
+          "$READELF" --dyn-syms --wide \
+            /tmp/lila-check/libcxx.so \
+            | grep '__emutls_get_address' \
+            | grep -v ' UND '
+
+          echo "Verificacao concluida."
+
+      - name: Limpar arquivos temporarios
+        run: |
+          rm -rf verified-apk/work
+          rm -f verified-apk/unsigned.apk
+          rm -f verified-apk/aligned.apk
+
+      - name: Disponibilizar APK corrigido
         uses: actions/upload-artifact@v4
         with:
-          name: Lila-Cozy-Night-APK-ARM64
-          path: engine/export/**/*.apk
+          name: Lila-Cozy-Night-APK-Corrigido
+          path: verified-apk/Lilas-Cozy-Night.apk
           if-no-files-found: error
           retention-days: 7
