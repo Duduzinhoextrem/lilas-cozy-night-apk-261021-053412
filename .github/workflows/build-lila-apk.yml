@@ -1,0 +1,73 @@
+name: Gerar APK Lila Cozy Night
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    name: Android ARM64
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout pacote do mod
+        uses: actions/checkout@v4
+      - name: Checkout Codename Engine Mobile (versao do projeto)
+        uses: actions/checkout@v4
+        with:
+          repository: CPsP-Team/CodenameEngine-Mobile
+          ref: 4af5529d60ebf2599372cd95463acfd6707c5cdd
+          path: engine
+      - name: Haxe 4.3.7
+        uses: krdlab/setup-haxe@v2
+        with:
+          haxe-version: 4.3.7
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android NDK r25c
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+      - name: Preparar mod e aplicativo
+        run: |
+          python3 scripts/prepare_engine.py --engine engine
+      - name: Instalar bibliotecas do engine
+        working-directory: engine
+        run: |
+          haxe -cp commandline -D analyzer-optimize --run Main setup -s
+      - name: Configurar Lime Android
+        working-directory: engine
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          haxelib run lime setup -alias -y
+          haxelib run lime config ANDROID_SDK "$ANDROID_HOME"
+          haxelib run lime config ANDROID_NDK_ROOT "$ANDROID_NDK_HOME"
+          haxelib run lime config JAVA_HOME "$JAVA_HOME"
+          haxelib run lime config ANDROID_SETUP true
+          haxelib set lime git
+          haxelib set hxcpp git
+          haxelib set flixel git
+          haxelib set flixel-addons git
+          haxelib set flixel-animate git
+          haxelib set hxdiscord_rpc git
+      - name: Compilar APK Android
+        working-directory: engine
+        run: |
+          haxelib run lime build android -final -D ONLY_ARM64
+      - name: Verificar APK gerado
+        run: |
+          find engine/export -type f -name '*.apk' -print
+          find engine/export -type f -name '*.apk' | grep .
+      - name: Disponibilizar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lila-Cozy-Night-APK-ARM64
+          path: engine/export/**/*.apk
+          if-no-files-found: error
+          retention-days: 7
